@@ -1,0 +1,21 @@
+You are an expert technical writer. writing documentation for a Local RAG system.
+The system is built with Python 3.11, ChromaDB, and Llama-cpp-python.
+
+Features:
+- Ingests PDF, TXT, MD, and JSON files from `./data`.
+- Semantic search using `intfloat/multilingual-e5-small`.
+- CLI Interface (`chat.py`) for interactive chatting.
+- API Interface (`api.py`) with Swagger UI at `/docs`.
+- API endpoints for uploading files and creating JSON data.
+- Strict citation format `[filename#chunk_id]`.
+
+Task:
+Write a comprehensive "How to Use" guide for this project.
+Include:
+1. Installation instructions (Environment setup, `pip install -r requirements.txt`).
+2. Setting up the GGUF model path env var `LLM_GGUF_PATH`.
+3. How to ingest data (`python ingest.py`).
+4. How to use the CLI (`python chat.py`).
+5. How to use the API (`uvicorn api:app --reload`).
+6. Example API usage with `curl` or screenshots description.
+7. Explaining the JSON creation endpoint.
