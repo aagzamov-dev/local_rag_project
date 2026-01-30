@@ -5,7 +5,7 @@ A clean Python 3.11 RAG system using ChromaDB, Llama-cpp-python, and Sentence Tr
 ## Prerequisites
 
 1.  **Environment**: Ensure you are in the python 3.11 environment.
-2.  **Model**: Ensure you have the model file at `.\models\qwen2.5-1.5b-instruct-q4_k_m.gguf`.
+2.  **Model**: Download the model from [here](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf) and place it at `.\models\qwen2.5-1.5b-instruct-q4_k_m.gguf`.
 3.  **Environment Variable**:
     You **MUST** set the model path before running the scripts.
     ```bash
