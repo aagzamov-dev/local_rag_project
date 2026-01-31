@@ -10,6 +10,29 @@ interface Message {
   model?: 'local' | 'openai';
 }
 
+const TOOL_TRACE_LABEL = 'Tool Trace:';
+const SOURCES_LABEL = 'Sources:';
+
+function splitAssistantContent(content: string) {
+  let main = content || '';
+  let toolTrace = '';
+  let sources = '';
+
+  const toolIndex = main.indexOf(TOOL_TRACE_LABEL);
+  if (toolIndex !== -1) {
+    toolTrace = main.slice(toolIndex + TOOL_TRACE_LABEL.length).trim();
+    main = main.slice(0, toolIndex).trim();
+  }
+
+  const sourcesIndex = main.indexOf(SOURCES_LABEL);
+  if (sourcesIndex !== -1) {
+    sources = main.slice(sourcesIndex + SOURCES_LABEL.length).trim();
+    main = main.slice(0, sourcesIndex).trim();
+  }
+
+  return { main, sources, toolTrace };
+}
+
 export default function ChatInterface() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
@@ -157,11 +180,33 @@ export default function ChatInterface() {
                ) : (
                  <>
                    {msg.role === 'assistant' && (
-                       <div style={{fontSize: '0.7rem', opacity: 0.6, marginBottom: '4px', textTransform: 'uppercase', letterSpacing: '0.5px'}}>
-                         {msg.model || 'local'} used
+                       <div className="model-chip">
+                         {(msg.model || 'local').toUpperCase()} USED
                        </div>
                    )}
-                   <ReactMarkdown>{msg.content}</ReactMarkdown>
+                   {(() => {
+                     if (msg.role !== 'assistant') {
+                       return <ReactMarkdown>{msg.content}</ReactMarkdown>;
+                     }
+                     const { main, sources, toolTrace } = splitAssistantContent(msg.content);
+                     return (
+                       <>
+                         <ReactMarkdown>{main}</ReactMarkdown>
+                         {sources && (
+                           <div className="meta-block sources-block">
+                             <div className="meta-label">Sources</div>
+                             <div className="meta-text">{sources}</div>
+                           </div>
+                         )}
+                         {toolTrace && (
+                           <div className="meta-block tool-block">
+                             <div className="meta-label">Tool Trace</div>
+                             <ReactMarkdown>{toolTrace}</ReactMarkdown>
+                           </div>
+                         )}
+                       </>
+                     );
+                   })()}
                  </>
                )}
             </div>

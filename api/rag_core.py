@@ -2,6 +2,8 @@ import os
 import re
 import logging
 import json
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 from openai import OpenAI
 from tools import get_openai_tools, get_local_tools_prompt, AVAILABLE_TOOLS
 
@@ -14,8 +16,15 @@ from llama_cpp import Llama
 
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
-CHROMA_PATH = "./chroma"
+BASE_DIR = Path(__file__).resolve().parent
+CHROMA_PATH = str(BASE_DIR / "chroma")
 EMBEDDING_MODEL_NAME = "intfloat/multilingual-e5-small"
+
+DEFAULT_TOP_K = int(os.getenv("RAG_TOP_K", "6"))
+MIN_SIMILARITY = float(os.getenv("RAG_MIN_SIMILARITY", "0.2"))
+MIN_TOOL_SIMILARITY = float(os.getenv("RAG_MIN_TOOL_SIMILARITY", "0.35"))
+MAX_CONTEXT_CHARS = int(os.getenv("RAG_MAX_CONTEXT_CHARS", "12000"))
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 
 _chroma_client = None
 _collection = None
@@ -24,6 +33,127 @@ _llm = None
 
 
 FALLBACK = "I don't have enough information to answer this."
+
+_CITATION_PATTERN = re.compile(r"\[[^\[\]]+#[^\[\]]+\]")
+
+_RAG_ONLY_RULES = f"""You are a retrieval-augmented assistant.
+Rules:
+- Use ONLY the information in CONTEXT to answer.
+- If the answer is not explicitly stated in CONTEXT, reply exactly: {FALLBACK}
+- When answering from CONTEXT, cite sources inline as [filename#chunk_id].
+- Do NOT invent citations or sources.
+"""
+
+_TIME_SENSITIVE_KEYWORDS = [
+    "today",
+    "now",
+    "current",
+    "currently",
+    "latest",
+    "recent",
+    "news",
+    "breaking",
+    "price",
+    "stock",
+    "exchange rate",
+    "rate",
+    "forecast",
+    "weather",
+    "temperature",
+    "humidity",
+    "wind",
+    "rain",
+    "snow",
+    "time",
+]
+
+_WEATHER_KEYWORDS = [
+    "weather",
+    "forecast",
+    "temperature",
+    "humidity",
+    "wind",
+    "rain",
+    "snow",
+]
+
+
+def _is_time_sensitive(query: str) -> bool:
+    q = (query or "").lower()
+    return any(keyword in q for keyword in _TIME_SENSITIVE_KEYWORDS)
+
+
+def _is_weather_query(query: str) -> bool:
+    q = (query or "").lower()
+    return any(keyword in q for keyword in _WEATHER_KEYWORDS)
+
+
+def _extract_weather_location(query: str) -> Optional[str]:
+    if not query:
+        return None
+    match = re.search(r"\b(?:in|at|for|on)\s+([A-Za-z0-9\s,.-]+)", query, re.IGNORECASE)
+    if match:
+        location = match.group(1).strip()
+        location = re.sub(
+            r"\b(today|now|right now|currently|this week|tonight)\b",
+            "",
+            location,
+            flags=re.IGNORECASE,
+        ).strip(" ,.-")
+        return location or None
+    match = re.search(r"\bweather\s+([A-Za-z0-9\s,.-]+)", query, re.IGNORECASE)
+    if match:
+        location = match.group(1).strip(" ,.-")
+        return location or None
+    return None
+
+
+def _should_use_tool(query: str, context_items: List[Dict[str, Any]]) -> bool:
+    if not context_items:
+        return True
+    max_sim = max((item.get("similarity", 0.0) for item in context_items), default=0.0)
+    if max_sim < MIN_TOOL_SIMILARITY:
+        return True
+    return _is_time_sensitive(query)
+
+
+def _should_use_context_only(query: str, context_items: List[Dict[str, Any]]) -> bool:
+    if not context_items:
+        return False
+    max_sim = max((item.get("similarity", 0.0) for item in context_items), default=0.0)
+    return max_sim >= MIN_TOOL_SIMILARITY and not _is_time_sensitive(query)
+
+
+def _infer_tool_call(query: str) -> Tuple[str, Dict[str, Any]]:
+    if _is_weather_query(query):
+        location = _extract_weather_location(query) or query
+        return "get_weather", {"location": location}
+    return "web_search", {"query": query}
+
+
+def _is_fallback_text(text: str) -> bool:
+    if not text:
+        return True
+    return FALLBACK.lower() in text.lower()
+
+_OPENAI_TOOL_RULES = f"""You are a retrieval-augmented assistant with tools.
+Decision policy:
+- If CONTEXT clearly contains the answer, use it and cite sources inline as [filename#chunk_id].
+- If CONTEXT is missing or insufficient, use a tool.
+- For time-sensitive or real-time questions, use a tool even if CONTEXT exists.
+- If tools fail to produce an answer, reply exactly: {FALLBACK}
+"""
+
+_LOCAL_TOOL_RULES = f"""You are a retrieval-augmented assistant with tools.
+Decision policy:
+- If CONTEXT clearly contains the answer, use it and cite sources inline as [filename#chunk_id].
+- If CONTEXT is missing or insufficient, use a tool.
+- For time-sensitive or real-time questions, use a tool even if CONTEXT exists.
+- If tools fail to produce an answer, reply exactly: {FALLBACK}
+
+Tool call format (output exactly, no extra text):
+TOOL_CALL {{"name":"tool_name","arguments":{{...}}}}
+"""
 
 
 def get_chroma_client():
@@ -71,11 +201,21 @@ def get_llm():
     return _llm
 
 
-def query_documents(query, top_k=5):
+def query_documents(query, top_k: Optional[int] = None, min_similarity: Optional[float] = None):
+    query = (query or "").strip()
+    if not query:
+        return []
+
+    if top_k is None:
+        top_k = DEFAULT_TOP_K
+    if min_similarity is None:
+        min_similarity = MIN_SIMILARITY
+
     collection = get_collection()
     model = get_embedding_model()
 
-    query_embedding = model.encode([query], normalize_embeddings=True).tolist()
+    # IMPORTANT: E5 models need 'query: ' prefix for queries
+    query_embedding = model.encode([f"query: {query}"], normalize_embeddings=True).tolist()
 
     results = collection.query(
         query_embeddings=query_embedding,
@@ -83,18 +223,25 @@ def query_documents(query, top_k=5):
         include=["documents", "metadatas", "distances"],
     )
 
-    documents = results["documents"][0]
-    metadatas = results["metadatas"][0]
-    ids = results["ids"][0]
-    distances = (
-        results["distances"][0] if "distances" in results else [0.0] * len(documents)
-    )
+    documents = results.get("documents", [[]])[0]
+    metadatas = results.get("metadatas", [[]])[0]
+    ids = results.get("ids", [[]])[0]
+    distances = results.get("distances", [[]])[0] if results else []
 
     retrieved = []
     for doc, meta, id_, dist in zip(documents, metadatas, ids, distances):
+        sim = max(0.0, 1.0 - dist)
         retrieved.append(
-            {"content": doc, "metadata": meta or {}, "id": id_, "distance": dist}
+            {
+                "content": doc,
+                "metadata": meta or {},
+                "id": id_,
+                "distance": dist,
+                "similarity": sim,
+            }
         )
+    if min_similarity is not None:
+        retrieved = [item for item in retrieved if item["similarity"] >= min_similarity]
     return retrieved
 
 
@@ -107,38 +254,52 @@ def _citation_for_item(item):
     return f"[{filename}#{chunk_id}]"
 
 
-def format_prompt(query, retrieved_items):
-    context_blocks = []
+def build_context(retrieved_items: List[Dict[str, Any]], max_chars: Optional[int] = None):
+    if max_chars is None:
+        max_chars = MAX_CONTEXT_CHARS
+
+    blocks = []
+    total = 0
+    seen = set()
     for item in retrieved_items:
         cite = _citation_for_item(item)
-        context_blocks.append(f"{cite}\n{item['content']}")
-    context_str = "\n\n".join(context_blocks)
-
-    prompt = f"""You are an efficient expert assistant.
-
-Rules:
-- Use ONLY facts that are explicitly stated verbatim in the provided information.
-- Do NOT use general knowledge, assumptions, background knowledge, or external facts.
-- Before answering, verify the provided information is directly and clearly relevant to the question.
-  If relevance is unclear or missing, output exactly:
-  {FALLBACK}
-- If the question requires any detail that is not explicitly stated in the provided information, output exactly:
-  {FALLBACK}
-- If the fallback sentence is used, output it ALONE.
-  Do NOT add explanations, reasoning, sources, or any additional text.
-- Do NOT summarize, generalize, or conclude beyond the stated facts.
-- Do NOT mention citations, filenames, chunk ids, sources, or the word "context".
-- Do NOT include bracketed text of any kind.
-- Write ONE concise paragraph (2–5 sentences), technical, factual, and neutral.
+        if cite in seen:
+            continue
+        seen.add(cite)
+        block = f"{cite}\n{item['content']}".strip()
+        if max_chars and total + len(block) > max_chars:
+            break
+        blocks.append(block)
+        total += len(block) + 2
+    return "\n\n".join(blocks)
 
 
-Context:
+def format_prompt(query, retrieved_items):
+    context_str = build_context(retrieved_items)
+    if not context_str:
+        context_str = "NONE"
+
+    prompt = f"""{_RAG_ONLY_RULES}
+
+CONTEXT:
 {context_str}
 
-Question: {query}
+QUESTION: {query}
 
-Answer:"""
+ANSWER:"""
     return prompt
+
+
+def _rag_only_messages(query: str, retrieved_items: List[Dict[str, Any]]):
+    context_str = build_context(retrieved_items)
+    if not context_str:
+        context_str = "NONE"
+    system_prompt = _RAG_ONLY_RULES
+    user_msg = f"CONTEXT:\n{context_str}\n\nQUESTION: {query}"
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_msg},
+    ]
 
 
 def run_openai_agent(query, context_items, api_key):
@@ -148,28 +309,50 @@ def run_openai_agent(query, context_items, api_key):
     """
     client = OpenAI(api_key=api_key)
     tools = get_openai_tools()
+    tool_trace = []
 
-    # Build context string
-    context_blocks = []
-    for item in context_items:
-        cite = _citation_for_item(item)
-        context_blocks.append(f"{cite}\n{item['content']}")
-    context_str = "\n\n".join(context_blocks)
+    if _should_use_context_only(query, context_items):
+        messages = _rag_only_messages(query, context_items)
+        try:
+            response = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=messages,
+                temperature=0.1,
+            )
+            content = response.choices[0].message.content or ""
+            if _is_fallback_text(content):
+                func_name, args = _infer_tool_call(query)
+                try:
+                    tool_output = AVAILABLE_TOOLS[func_name](**args)
+                except Exception as e:
+                    tool_output = f"Error: {str(e)}"
+                tool_trace.append(
+                    {"name": func_name, "arguments": args, "result": tool_output}
+                )
+                followup = [
+                    *messages,
+                    {
+                        "role": "user",
+                        "content": f"TOOL_RESULT:\n{tool_output}\n\nAnswer the question now.",
+                    },
+                ]
+                final_res = client.chat.completions.create(
+                    model=OPENAI_MODEL, messages=followup, temperature=0.1
+                )
+                final_text = final_res.choices[0].message.content or ""
+                if _is_fallback_text(final_text):
+                    return str(tool_output), True, tool_trace
+                return final_text, True, tool_trace
+            return content, False, tool_trace
+        except Exception as e:
+            return f"OpenAI Agent Error: {str(e)}", False, tool_trace
 
-    system_prompt = """You are a helpful and intelligent assistant.
-    
-    You have access to a knowledge base (CONTEXT) and external tools.
-    
-    STRATEGY:
-    1. First, check if the user's question can be answered using the provided CONTEXT. 
-       - If YES, verify the facts, use them to answer, and cite the source filename in your answer if relevant.
-    2. If the CONTEXT is missing, irrelevant, or does not contain the answer, you SHOULD use the available tools (e.g. web_search, get_weather) to find the answer.
-    3. If the question is about current events, weather, or specific real-time data, IGNORE the context and immediate use the tools.
-    
-    Do not mention "I don't have enough information" unless you have tried both the context AND the tools and failed.
-    """
+    context_str = build_context(context_items)
+    if not context_str:
+        context_str = "NONE"
 
-    user_msg = f"Context:\n{context_str}\n\nQuestion: {query}"
+    system_prompt = _OPENAI_TOOL_RULES
+    user_msg = f"CONTEXT:\n{context_str}\n\nQUESTION: {query}"
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -179,7 +362,7 @@ def run_openai_agent(query, context_items, api_key):
     try:
         # First call
         response = client.chat.completions.create(
-            model="gpt-4o",
+            model=OPENAI_MODEL,
             messages=messages,
             tools=tools,
             tool_choice="auto",
@@ -207,6 +390,10 @@ def run_openai_agent(query, context_items, api_key):
                 except Exception as e:
                     tool_output = f"Error: {str(e)}"
 
+                tool_trace.append(
+                    {"name": func_name, "arguments": args, "result": tool_output}
+                )
+
                 messages.append(
                     {
                         "role": "tool",
@@ -217,123 +404,238 @@ def run_openai_agent(query, context_items, api_key):
 
             # Second call to get final answer
             final_res = client.chat.completions.create(
-                model="gpt-4o", messages=messages, temperature=0.1
+                model=OPENAI_MODEL, messages=messages, temperature=0.1
             )
-            return final_res.choices[0].message.content, True
+            final_text = final_res.choices[0].message.content or ""
+            if _is_fallback_text(final_text) and tool_trace:
+                return str(tool_trace[-1].get("result", "")), True, tool_trace
+            return final_text, True, tool_trace
 
         else:
-            return response_msg.content, False
+            if _should_use_tool(query, context_items):
+                func_name, args = _infer_tool_call(query)
+                try:
+                    tool_output = AVAILABLE_TOOLS[func_name](**args)
+                except Exception as e:
+                    tool_output = f"Error: {str(e)}"
+                tool_trace.append(
+                    {"name": func_name, "arguments": args, "result": tool_output}
+                )
+                followup = [
+                    *messages,
+                    {
+                        "role": "user",
+                        "content": f"TOOL_RESULT:\n{tool_output}\n\nAnswer the question now.",
+                    },
+                ]
+                final_res = client.chat.completions.create(
+                    model=OPENAI_MODEL, messages=followup, temperature=0.1
+                )
+                final_text = final_res.choices[0].message.content or ""
+                if _is_fallback_text(final_text):
+                    return str(tool_output), True, tool_trace
+                return final_text, True, tool_trace
+
+            return response_msg.content, False, tool_trace
 
     except Exception as e:
-        return f"OpenAI Agent Error: {str(e)}", False
+        return f"OpenAI Agent Error: {str(e)}", False, tool_trace
 
 
 def run_local_agent(query, context_items, llm):
     """
     Local Agent using ReAct (Thought-Action-Observation) styling.
     """
+    tool_trace = []
+
+    if _should_use_context_only(query, context_items):
+        messages = _rag_only_messages(query, context_items)
+        text = _local_chat(llm, messages, max_tokens=512, temperature=0.1)
+        if _is_fallback_text(text):
+            func_name, args = _infer_tool_call(query)
+            try:
+                result = AVAILABLE_TOOLS[func_name](**args)
+            except Exception as e:
+                result = f"Tool error: {e}"
+            tool_trace.append({"name": func_name, "arguments": args, "result": result})
+            followup_messages = [
+                *messages,
+                {"role": "assistant", "content": "TOOL_CALL"},
+                {"role": "user", "content": f"TOOL_RESULT:\n{result}\n\nAnswer the question now."},
+            ]
+            final_text = _local_chat(
+                llm, followup_messages, max_tokens=512, temperature=0.1
+            )
+            if _is_fallback_text(final_text):
+                return str(result), True, tool_trace
+            return final_text, True, tool_trace
+        return text, False, tool_trace
+
     tool_instructions = get_local_tools_prompt()
+    context_str = build_context(context_items)
+    if not context_str:
+        context_str = "NONE"
 
-    # Build text context
-    context_blocks = []
-    for item in context_items:
-        cite = _citation_for_item(item)
-        context_blocks.append(f"{cite}\n{item['content']}")
-    context_str = "\n\n".join(context_blocks)
+    system_prompt = f"""{_LOCAL_TOOL_RULES}
 
-    # Prompt engineering for local model (Llama-3 style or Alpaca style)
-    # We need a prompt that encourages checking context first, then tools.
+Available tools:
+{tool_instructions.strip()}
+"""
+    user_msg = f"CONTEXT:\n{context_str}\n\nQUESTION: {query}"
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_msg},
+    ]
 
-    full_prompt = f"""You are a helpful assistant.
+    text = _local_chat(llm, messages, max_tokens=512, temperature=0.1)
+    tool_call = _parse_tool_call(text)
 
-TOOLS:
-{tool_instructions}
+    if tool_call:
+        func_name = tool_call.get("name")
+        args = tool_call.get("arguments", {})
+        if func_name not in AVAILABLE_TOOLS:
+            return FALLBACK, False, tool_trace
 
-CONTEXT:
-{context_str}
-
-INSTRUCTIONS:
-1. Try to answer the User's Question using the CONTEXT above.
-2. If the CONTEXT is not relevant or missing the answer, use a tool (like web_search or get_weather).
-3. To use a tool, output: req_tool: tool_name("arg")
-4. Do NOT say "I don't have enough information" without trying a tool first.
-
-User: {query}
-Assistant:"""
-
-    # 1. Generate (Stop at req_tool: or normal stops)
-    output = llm.create_completion(
-        full_prompt,
-        max_tokens=256,
-        stop=["Observation:", "User:", "<|im_end|>"],
-        temperature=0.1,
-    )
-    text = output["choices"][0]["text"]
-
-    if "req_tool:" in text:
         try:
-            tool_request = text.split("req_tool:")[-1].strip()
-            if "(" in tool_request and ")" in tool_request:
-                func_name = tool_request.split("(")[0].strip()
-                arg_raw = tool_request.split("(")[1].split(")")[0]
-                arg_val = arg_raw.strip('"').strip("'")
-
-                if func_name in AVAILABLE_TOOLS:
-                    print(f"Local Agent Calling: {func_name} with {arg_val}")
-                    result = AVAILABLE_TOOLS[func_name](arg_val)
-
-                    # Feed back observation
-                    new_prompt = (
-                        f"{full_prompt}{text}\nObservation: {result}\nAssistant:"
-                    )
-
-                    final_out = llm.create_completion(
-                        new_prompt,
-                        max_tokens=256,
-                        stop=["User:", "<|im_end|>"],
-                        temperature=0.1,
-                    )
-                    return final_out["choices"][0]["text"], True
-
-            return text + "\n[System: Could not parse tool request properly]", False
-
+            args = _normalize_tool_args(func_name, args)
+            result = AVAILABLE_TOOLS[func_name](**args)
         except Exception as e:
-            return f"{text} [Error processing tool request: {e}]", False
+            result = f"Tool error: {e}"
 
-    return text, False
+        tool_trace.append({"name": func_name, "arguments": args, "result": result})
+
+        followup_messages = [
+            *messages,
+            {"role": "assistant", "content": tool_call.get("raw", "TOOL_CALL")},
+            {"role": "user", "content": f"TOOL_RESULT:\n{result}\n\nAnswer the question now."},
+        ]
+        final_text = _local_chat(llm, followup_messages, max_tokens=512, temperature=0.1)
+        if _is_fallback_text(final_text):
+            return str(result), True, tool_trace
+        return final_text, True, tool_trace
+
+    if _should_use_tool(query, context_items):
+        func_name, args = _infer_tool_call(query)
+        try:
+            result = AVAILABLE_TOOLS[func_name](**args)
+        except Exception as e:
+            result = f"Tool error: {e}"
+        tool_trace.append({"name": func_name, "arguments": args, "result": result})
+
+        followup_messages = [
+            *messages,
+            {"role": "assistant", "content": "TOOL_CALL"},
+            {"role": "user", "content": f"TOOL_RESULT:\n{result}\n\nAnswer the question now."},
+        ]
+        final_text = _local_chat(llm, followup_messages, max_tokens=512, temperature=0.1)
+        if _is_fallback_text(final_text):
+            return str(result), True, tool_trace
+        return final_text, True, tool_trace
+
+    return text, False, tool_trace
 
 
-def finalize_answer(model_text, retrieved_items, tool_used=False):
+def finalize_answer(model_text, retrieved_items, tool_used=False, tool_trace=None):
     text = model_text.strip()
-    text = re.sub(r"\[[^\]]+\]", "", text).strip()
     text = re.sub(r"\s+", " ", text).strip()
     text = re.sub(r"\s+([,.!?])", r"\1", text)
 
-    if FALLBACK.lower() in text.lower() and len(text) < 100:
+    if not text:
         return FALLBACK
 
-    # HIDE SOURCES IF TOOL USED
+    if FALLBACK.lower() in text.lower():
+        return FALLBACK
+
     if tool_used:
+        if tool_trace:
+            try:
+                trace_json = json.dumps(tool_trace, ensure_ascii=False, indent=2)
+            except Exception:
+                trace_json = str(tool_trace)
+            return f"{text}\n\nTool Trace:\n```json\n{trace_json}\n```"
         return text
 
-    scores = []
-    total_score = 0.0
-    for item in retrieved_items:
-        dist = item.get("distance", 1.0)
-        sim = max(0.0, 1.0 - dist)
-        scores.append(sim)
-        total_score += sim
+    if not retrieved_items:
+        return FALLBACK
 
-    if total_score <= 0:
-        total_score = 1.0
+    if _CITATION_PATTERN.search(text):
+        return text
 
     sources_list = []
     seen = set()
-    for item, score in zip(retrieved_items, scores):
+    for item in retrieved_items:
         c = _citation_for_item(item)
         if c not in seen:
             seen.add(c)
-            pct = (score / total_score) * 100
-            sources_list.append(f"{c} ({int(pct)}%)")
+            sources_list.append(c)
 
     return f"{text}\n\nSources: {', '.join(sources_list)}"
+
+
+def _local_chat(llm, messages, max_tokens=512, temperature=0.1):
+    if hasattr(llm, "create_chat_completion"):
+        res = llm.create_chat_completion(
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        return res["choices"][0]["message"]["content"]
+
+    prompt = _render_messages(messages)
+    res = llm.create_completion(
+        prompt,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        stop=["User:", "Assistant:", "<|im_end|>"],
+    )
+    return res["choices"][0]["text"]
+
+
+def _render_messages(messages):
+    parts = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if role == "system":
+            parts.append(f"System: {content}")
+        elif role == "user":
+            parts.append(f"User: {content}")
+        else:
+            parts.append(f"Assistant: {content}")
+    parts.append("Assistant:")
+    return "\n\n".join(parts)
+
+
+def _parse_tool_call(text: str) -> Optional[Dict[str, Any]]:
+    if "TOOL_CALL" not in text:
+        return None
+
+    after = text.split("TOOL_CALL", 1)[1].strip()
+    brace_index = after.find("{")
+    if brace_index == -1:
+        return None
+
+    raw = after[brace_index:]
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(raw)
+    except json.JSONDecodeError:
+        return None
+
+    if not isinstance(obj, dict) or "name" not in obj:
+        return None
+
+    obj["raw"] = f"TOOL_CALL {json.dumps(obj, ensure_ascii=False)}"
+    return obj
+
+
+def _normalize_tool_args(name: str, args: Any) -> Dict[str, Any]:
+    if isinstance(args, dict):
+        return args
+    if isinstance(args, str):
+        if name == "web_search":
+            return {"query": args}
+        if name == "get_weather":
+            return {"location": args}
+        if name == "get_country_info":
+            return {"country": args}
+    return {}

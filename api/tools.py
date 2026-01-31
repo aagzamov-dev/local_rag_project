@@ -1,11 +1,97 @@
 import json
+import re
 import requests
+
+REQUEST_TIMEOUT = 10
 
 try:
     from duckduckgo_search import DDGS
 except ImportError:
     # Fallback or alias handling if package name changed fully
     from ddgs import DDGS
+
+
+_STOPWORDS = {
+    "the",
+    "a",
+    "an",
+    "of",
+    "in",
+    "on",
+    "at",
+    "for",
+    "to",
+    "from",
+    "about",
+    "info",
+    "information",
+    "what",
+    "who",
+    "when",
+    "where",
+    "why",
+    "how",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "do",
+    "does",
+    "did",
+    "please",
+}
+
+
+def _normalize_query(text: str) -> str:
+    cleaned = (text or "").strip()
+    cleaned = cleaned.replace('"', "").replace("'", "")
+    cleaned = re.sub(r"[?!.]+", " ", cleaned)
+    cleaned = re.sub(r"[^\w\s\-]", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def _expand_search_queries(query: str):
+    base = _normalize_query(query)
+    if not base:
+        return []
+
+    tokens = [t for t in re.split(r"\s+", base) if t]
+    filtered = [t for t in tokens if t.lower() not in _STOPWORDS]
+    no_stop = " ".join(filtered) if filtered else base
+
+    variants = [base, no_stop, f"\"{base}\"" if base else ""]
+
+    lower_base = base.lower()
+    if "created year" in lower_base:
+        variants.extend(
+            [
+                lower_base.replace("created year", "founded"),
+                lower_base.replace("created year", "founded year"),
+                lower_base.replace("created year", "founded in"),
+                lower_base.replace("created year", "established"),
+                f"{no_stop} founded",
+            ]
+        )
+
+    if "who is" in lower_base:
+        variants.append(lower_base.replace("who is", "about"))
+
+    # Add a focused entity variant if query is short
+    if len(tokens) <= 3:
+        variants.append(f"{base} official site")
+
+    # De-duplicate while preserving order
+    seen = set()
+    expanded = []
+    for v in variants:
+        v = _normalize_query(v)
+        if v and v.lower() not in seen:
+            seen.add(v.lower())
+            expanded.append(v)
+    return expanded
 
 
 def web_search(query: str):
@@ -15,10 +101,34 @@ def web_search(query: str):
     """
     try:
         with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=3))
-            if not results:
-                return "No results found."
-            return json.dumps(results, ensure_ascii=False)
+            expanded = _expand_search_queries(query)
+            all_results = []
+            seen_urls = set()
+
+            for q in expanded[:5]:
+                batch = list(ddgs.text(q, max_results=6))
+                if not batch:
+                    batch = list(ddgs.text(q, max_results=6, backend="lite"))
+                if not batch:
+                    batch = list(ddgs.text(q, max_results=6, backend="html"))
+                for item in batch:
+                    url = (item.get("href") or item.get("url") or "").strip()
+                    if url and url in seen_urls:
+                        continue
+                    if url:
+                        seen_urls.add(url)
+                    item["query"] = q
+                    all_results.append(item)
+                if len(all_results) >= 12:
+                    break
+
+            payload = {
+                "source": "duckduckgo",
+                "query": query,
+                "expanded_queries": expanded,
+                "results": all_results,
+            }
+            return json.dumps(payload, ensure_ascii=False)
     except Exception as e:
         return f"Search Error: {str(e)}"
 
@@ -30,7 +140,7 @@ def get_weather(location: str):
     try:
         # 1. Geocoding
         geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={location}&count=1&language=en&format=json"
-        geo_res = requests.get(geo_url).json()
+        geo_res = requests.get(geo_url, timeout=REQUEST_TIMEOUT).json()
         if not geo_res.get("results"):
             return f"Could not find location: {location}"
 
@@ -40,13 +150,23 @@ def get_weather(location: str):
 
         # 2. Weather
         weather_url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m&timezone=auto"
-        w_res = requests.get(weather_url).json()
+        w_res = requests.get(weather_url, timeout=REQUEST_TIMEOUT).json()
 
         current = w_res.get("current", {})
         temp = current.get("temperature_2m", "N/A")
         wind = current.get("wind_speed_10m", "N/A")
+        humidity = current.get("relative_humidity_2m", "N/A")
 
-        return f"Weather in {name}: {temp}°C, Wind: {wind} km/h"
+        payload = {
+            "source": "open-meteo",
+            "location": {"name": name, "latitude": lat, "longitude": lon},
+            "current": {
+                "temperature_c": temp,
+                "wind_kmh": wind,
+                "humidity_percent": humidity,
+            },
+        }
+        return json.dumps(payload, ensure_ascii=False)
     except Exception as e:
         return f"Weather Error: {str(e)}"
 
@@ -57,11 +177,11 @@ def get_country_info(country: str):
     """
     try:
         url = f"https://restcountries.com/v3.1/name/{country}?fullText=true"
-        res = requests.get(url)
+        res = requests.get(url, timeout=REQUEST_TIMEOUT)
         if res.status_code != 200:
             # Try partial match if full fails
             url = f"https://restcountries.com/v3.1/name/{country}"
-            res = requests.get(url)
+            res = requests.get(url, timeout=REQUEST_TIMEOUT)
             if res.status_code != 200:
                 return f"Could not find country: {country}"
 
@@ -158,19 +278,19 @@ You have access to the following tools:
 2. get_weather(location: str): Get weather for a city.
 3. get_country_info(country: str): Get facts about a country.
 
-To use a tool, you MUST format your output exactly like this:
-req_tool: tool_name(argument)
+To use a tool, you MUST output exactly one line:
+TOOL_CALL {"name":"tool_name","arguments":{...}}
 
 Examples:
 User: "What is the weather in Paris?"
-Assistant: req_tool: get_weather("Paris")
+Assistant: TOOL_CALL {"name":"get_weather","arguments":{"location":"Paris"}}
 
 User: "Who is the president of Brazil?"
-Assistant: req_tool: web_search("President of Brazil")
+Assistant: TOOL_CALL {"name":"web_search","arguments":{"query":"President of Brazil"}}
 
 User: "Tell me about Japan."
-Assistant: req_tool: get_country_info("Japan")
+Assistant: TOOL_CALL {"name":"get_country_info","arguments":{"country":"Japan"}}
 
 Do NOT output anything else when requesting a tool.
-Wait for the observation before answering.
+Wait for the tool result before answering.
 """

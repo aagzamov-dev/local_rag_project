@@ -11,8 +11,6 @@ from fastapi.responses import StreamingResponse
 from rag_core import (
     get_llm,
     query_documents,
-    format_prompt,
-    get_chroma_client,
     finalize_answer,
 )
 
@@ -51,12 +49,14 @@ app.add_middleware(
 
 # Global LLM instance to avoid reloading
 llm = None
-DATA_DIR = "./data"
+DATA_DIR = str(BASE_DIR / "data")
 
 
 class ChatRequest(BaseModel):
     query: str
     model: str = "local"
+    top_k: Optional[int] = None
+    min_similarity: Optional[float] = None
 
 
 class JsonCreateRequest(BaseModel):
@@ -79,13 +79,18 @@ def startup_event():
 
 @app.post("/chat")
 async def chat_endpoint(request: ChatRequest):
-    retrieved = query_documents(request.query, top_k=5)
+    retrieved = query_documents(
+        request.query,
+        top_k=request.top_k,
+        min_similarity=request.min_similarity,
+    )
 
     # We NO LONGER pre-format prompt here for agents.
     # Agents build their own prompts from query + retrieved context.
 
     response_text = ""
     tool_used = False
+    tool_trace = []
 
     if request.model == "openai":
         api_key = os.getenv("OPENAI_API_KEY")
@@ -94,7 +99,7 @@ async def chat_endpoint(request: ChatRequest):
 
         from rag_core import run_openai_agent
 
-        response_text, tool_used = run_openai_agent(request.query, retrieved, api_key)
+        response_text, tool_used, tool_trace = run_openai_agent(request.query, retrieved, api_key)
 
     else:
         if not llm:
@@ -102,9 +107,11 @@ async def chat_endpoint(request: ChatRequest):
 
         from rag_core import run_local_agent
 
-        response_text, tool_used = run_local_agent(request.query, retrieved, llm)
+        response_text, tool_used, tool_trace = run_local_agent(request.query, retrieved, llm)
 
-    final_response = finalize_answer(response_text, retrieved, tool_used=tool_used)
+    final_response = finalize_answer(
+        response_text, retrieved, tool_used=tool_used, tool_trace=tool_trace
+    )
 
     # Streaming the final string so frontend logic remains compatible
     def iter_final():

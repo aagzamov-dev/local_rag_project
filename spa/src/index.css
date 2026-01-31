@@ -202,6 +202,43 @@ body {
   box-shadow: 0 2px 4px rgba(0,0,0,0.1);
 }
 
+.model-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.65rem;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color);
+  background: rgba(15, 23, 42, 0.6);
+  margin-bottom: 8px;
+}
+
+.meta-block {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--border-color);
+  background: rgba(15, 23, 42, 0.5);
+}
+
+.meta-label {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+
+.meta-text {
+  font-size: 0.85rem;
+  color: var(--text-primary);
+  word-break: break-word;
+}
+
 .message-row.user .message-bubble {
   background-color: var(--primary-color);
   color: white;
@@ -534,4 +571,3 @@ textarea.data-input {
 .model-btn.active .icon {
   color: var(--primary-color);
 }
-

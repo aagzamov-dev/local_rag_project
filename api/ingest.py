@@ -3,12 +3,14 @@ import os
 import glob
 import json
 import uuid
+from pathlib import Path
 from pypdf import PdfReader
 from rag_core import get_collection, get_embedding_model
 
-DATA_DIR = "./data"
-CHUNK_SIZE = 900
-CHUNK_OVERLAP = 150
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = str(BASE_DIR / "data")
+CHUNK_SIZE = int(os.getenv("RAG_CHUNK_SIZE", "900"))
+CHUNK_OVERLAP = int(os.getenv("RAG_CHUNK_OVERLAP", "150"))
 
 
 def load_documents():

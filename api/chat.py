@@ -1,5 +1,5 @@
 import sys
-from rag_core import get_llm, query_documents, format_prompt
+from rag_core import get_llm, query_documents, run_local_agent, finalize_answer
 
 def main():
     print("Initializing RAG Chat System... (Loading Model)")
@@ -20,28 +20,14 @@ def main():
             continue
             
         print("Retrieving context...")
-        retrieved = query_documents(query, top_k=5)
-        
-        if not retrieved:
-            print("Assistant: I found no relevant documents in the database.")
-            continue
-            
-        prompt = format_prompt(query, retrieved)
-        
-        print("\nAssistant: ", end="", flush=True)
-        stream = llm.create_completion(
-            prompt,
-            max_tokens=1024,
-            stop=["<|im_end|>", "User:", "Question:"],
-            stream=True,
-            temperature=0.1,
-            repeat_penalty=1.1
+        retrieved = query_documents(query)
+
+        response_text, tool_used, tool_trace = run_local_agent(query, retrieved, llm)
+        final_response = finalize_answer(
+            response_text, retrieved, tool_used=tool_used, tool_trace=tool_trace
         )
-        
-        for output in stream:
-            text = output['choices'][0]['text']
-            print(text, end="", flush=True)
-        print() # Newline
+
+        print("\nAssistant:", final_response)
 
 if __name__ == "__main__":
     # To run: python chat.py

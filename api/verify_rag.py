@@ -58,16 +58,15 @@ def test_success():
     model_output = "The answer is 42 [doc1.txt#1]. "
     res = finalize_answer(model_output, retrieved)
 
-    expected_text = "The answer is 42."
-    expected_sources = "Sources: [doc1.txt#1], [doc2.txt#2]"
-
+    expected_text = "The answer is 42 [doc1.txt#1]."
     assert expected_text in res, f"Expected text '{expected_text}' not in '{res}'"
-    assert expected_sources in res, (
-        f"Expected sources '{expected_sources}' not in '{res}'"
-    )
 
-    # deduplication check
-    assert res.count("[doc1.txt#1]") == 1, "Duplicate source found in output"
+    # If citations exist in the model output, finalize_answer should not append sources.
+    assert "Sources:" not in res, "Did not expect appended sources when citations exist"
+
+    # Case 2: No citations -> append sources
+    res2 = finalize_answer("The answer is 42.", retrieved)
+    assert "Sources:" in res2, "Expected appended sources when citations are missing"
 
     print("Success tests passed!")
 
