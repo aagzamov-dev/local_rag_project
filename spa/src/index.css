@@ -483,7 +483,55 @@ textarea.data-input {
   color: var(--text-secondary);
   font-weight: 500;
 }
-.tab.active {
-  background-color: var(--surface-hover);
+
+/* Chat Header */
+.chat-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 24px;
+  background: var(--surface-color);
+  border-bottom: 1px solid var(--border-color);
+  z-index: 10;
+  width: 100%;
+}
+.chat-header h3 {
+  margin: 0;
+  font-size: 1.1rem;
+  font-weight: 600;
   color: var(--text-primary);
 }
+
+.model-selector {
+  display: flex;
+  background: var(--bg-color);
+  padding: 4px;
+  border-radius: 12px;
+  border: 1px solid var(--border-color);
+}
+.model-btn {
+  background: transparent;
+  border: none;
+  padding: 6px 14px;
+  border-radius: 8px;
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.model-btn:hover {
+  color: var(--text-primary);
+}
+.model-btn.active {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+  box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+}
+.model-btn.active .icon {
+  color: var(--primary-color);
+}
+

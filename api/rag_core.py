@@ -1,6 +1,7 @@
 import os
 import re
 import logging
+from openai import OpenAI
 
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN_WARNING"] = "1"
@@ -13,7 +14,6 @@ logging.getLogger("transformers").setLevel(logging.ERROR)
 
 CHROMA_PATH = "./chroma"
 EMBEDDING_MODEL_NAME = "intfloat/multilingual-e5-small"
-LLM_GGUF_PATH = os.getenv("LLM_GGUF_PATH")
 
 _chroma_client = None
 _collection = None
@@ -53,10 +53,13 @@ def get_llm():
     global _llm
     if _llm is not None:
         return _llm
-    if not LLM_GGUF_PATH:
+
+    llm_path = os.getenv("LLM_GGUF_PATH")
+    if not llm_path:
         raise ValueError("Environment variable LLM_GGUF_PATH is not set.")
+
     _llm = Llama(
-        model_path=LLM_GGUF_PATH,
+        model_path=llm_path,
         n_ctx=4096,
         n_gpu_layers=0,
         n_threads=max(1, os.cpu_count() or 8),
@@ -75,16 +78,21 @@ def query_documents(query, top_k=5):
     results = collection.query(
         query_embeddings=query_embedding,
         n_results=top_k,
-        include=["documents", "metadatas"],
+        include=["documents", "metadatas", "distances"],
     )
 
     documents = results["documents"][0]
     metadatas = results["metadatas"][0]
     ids = results["ids"][0]
+    distances = (
+        results["distances"][0] if "distances" in results else [0.0] * len(documents)
+    )
 
     retrieved = []
-    for doc, meta, id_ in zip(documents, metadatas, ids):
-        retrieved.append({"content": doc, "metadata": meta or {}, "id": id_})
+    for doc, meta, id_, dist in zip(documents, metadatas, ids, distances):
+        retrieved.append(
+            {"content": doc, "metadata": meta or {}, "id": id_, "distance": dist}
+        )
     return retrieved
 
 
@@ -131,6 +139,26 @@ Answer:"""
     return prompt
 
 
+def run_openai_completion(prompt, api_key):
+    client = OpenAI(api_key=api_key)
+    try:
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant. Keep your answers concise and strictly based on the context provided entirely in the user prompt.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=200,
+            temperature=0.1,
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"OpenAI Error: {str(e)}"
+
+
 def finalize_answer(model_text, retrieved_items):
     text = model_text.strip()
 
@@ -138,19 +166,37 @@ def finalize_answer(model_text, retrieved_items):
     text = re.sub(r"\[[^\]]+\]", "", text).strip()
     text = re.sub(r"\s+", " ", text).strip()
 
-    # Fix spacing before punctuation (e.g. "word ." -> "word.")
+    # Fix spacing before punctuation
     text = re.sub(r"\s+([,.!?])", r"\1", text)
 
     # Deterministic fallback check
     if FALLBACK.lower() in text.lower():
         return FALLBACK
 
-    sources = []
-    seen = set()
+    # Calculate percentages based on similarity
+    # similarity = 1 - cosine_distance
+    # Clip to [0, 1] just in case
+    scores = []
+    total_score = 0.0
+
     for item in retrieved_items:
+        dist = item.get("distance", 1.0)
+        # Handle cases where dist might be > 1 or < 0
+        sim = max(0.0, 1.0 - dist)
+        scores.append(sim)
+        total_score += sim
+
+    if total_score <= 0:
+        total_score = 1.0  # Avoid division by zero
+
+    sources_list = []
+    seen = set()
+
+    for item, score in zip(retrieved_items, scores):
         c = _citation_for_item(item)
         if c not in seen:
             seen.add(c)
-            sources.append(c)
+            pct = (score / total_score) * 100
+            sources_list.append(f"{c} ({int(pct)}%)")
 
-    return f"{text}\nSources: {', '.join(sources)}"
+    return f"{text}\n\nSources: {', '.join(sources_list)}"

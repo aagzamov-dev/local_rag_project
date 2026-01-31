@@ -8,22 +8,36 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
 from fastapi.responses import StreamingResponse
-from rag_core import get_llm, query_documents, format_prompt, get_chroma_client
+from rag_core import (
+    get_llm,
+    query_documents,
+    format_prompt,
+    get_chroma_client,
+    run_openai_completion,
+    finalize_answer,
+)
 
-# Load env vars from project root (one level up from this file)
-BASE_DIR = Path(__file__).resolve().parent.parent
+# Load env vars from current directory (api/)
+BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
-load_dotenv(ENV_PATH)
+load_dotenv(ENV_PATH, override=True)
+
+openai_key = os.getenv("OPENAI_API_KEY")
+if openai_key:
+    masked = openai_key[:4] + "*" * (len(openai_key) - 8) + openai_key[-4:]
+    print(f"Loaded OpenAI Key: {masked}")
+else:
+    print("Warning: No OpenAI Key loaded.")
 
 # Fix relative model path if it exists
 model_path = os.getenv("LLM_GGUF_PATH")
-if model_path and (model_path.startswith(".") or model_path.startswith("\\")):
-    # Assuming relative path in .env is relative to Project Root, not api/ dir
-    # Remove leading characters if needed or just join
-    clean_path = model_path.lstrip(".\\/")
-    abs_path = BASE_DIR / clean_path
-    os.environ["LLM_GGUF_PATH"] = str(abs_path)
-    print(f"Resolved Model Path: {abs_path}")
+if model_path:
+    # If path is relative, resolve it against api/ directory for robustness
+    if not os.path.isabs(model_path):
+        clean_path = model_path.lstrip(".\\/")
+        abs_path = BASE_DIR / clean_path
+        os.environ["LLM_GGUF_PATH"] = str(abs_path)
+        print(f"Resolved Model Path: {abs_path}")
 
 app = FastAPI(title="Local RAG API", version="1.0")
 
@@ -40,12 +54,16 @@ app.add_middleware(
 llm = None
 DATA_DIR = "./data"
 
+
 class ChatRequest(BaseModel):
     query: str
+    model: str = "local"
+
 
 class JsonCreateRequest(BaseModel):
     filename: str
     data: dict
+
 
 @app.on_event("startup")
 def startup_event():
@@ -59,71 +77,86 @@ def startup_event():
     except Exception as e:
         print(f"Error loading LLM: {e}")
 
+
 @app.post("/chat")
 async def chat_endpoint(request: ChatRequest):
-    if not llm:
-        raise HTTPException(status_code=500, detail="LLM not initialized.")
-    
-    retrieved = query_documents(request.query, top_k=3)
+    retrieved = query_documents(request.query, top_k=5)
     prompt = format_prompt(request.query, retrieved)
-    
-    # We need to capture the full response to append citations properly
-    # Streaming with appended content is tricky without client-side logic
-    # switching to standard response for stability with the new strict format
-    
+
     response_text = ""
-    stream = llm.create_completion(
-        prompt,
-        max_tokens=512,
-        stop=["User:", "Question:", "Answer:", "<|im_end|>"],
-        stream=True,
-        temperature=0.1,
-        repeat_penalty=1.1
-    )
-    
-    for output in stream:
-        response_text += output['choices'][0]['text']
-        
-    from rag_core import finalize_answer
+
+    if request.model == "openai":
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key or "INSERT_YOUR_KEY" in api_key:
+            # Just a warning or strictly fail? User implies "take token", I'll assume they will update.
+            # But if I put placeholder, it will fail. I'll let it try.
+            if not api_key:
+                raise HTTPException(status_code=500, detail="OPENAI_API_KEY not set.")
+
+        response_text = run_openai_completion(prompt, api_key)
+
+    else:
+        if not llm:
+            raise HTTPException(status_code=500, detail="LLM not initialized.")
+
+        stream = llm.create_completion(
+            prompt,
+            max_tokens=512,
+            stop=["User:", "Question:", "Answer:", "<|im_end|>"],
+            stream=True,
+            temperature=0.1,
+            repeat_penalty=1.1,
+        )
+
+        for output in stream:
+            response_text += output["choices"][0]["text"]
+
     final_response = finalize_answer(response_text, retrieved)
-    
+
     # Streaming the final string so frontend logic remains compatible
     def iter_final():
         yield final_response
 
     return StreamingResponse(iter_final(), media_type="text/plain")
 
+
 @app.post("/upload")
 async def upload_files(files: List[UploadFile] = File(...)):
     if not os.path.exists(DATA_DIR):
         os.makedirs(DATA_DIR)
-        
+
     saved_files = []
     for file in files:
         file_path = os.path.join(DATA_DIR, file.filename)
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
         saved_files.append(file.filename)
-        
-    return {"message": "Files uploaded successfully", "files": saved_files, "note": "Run ingest logic to index these files."}
+
+    return {
+        "message": "Files uploaded successfully",
+        "files": saved_files,
+        "note": "Run ingest logic to index these files.",
+    }
+
 
 @app.post("/create-json")
 async def create_json_file(request: JsonCreateRequest):
     if not os.path.exists(DATA_DIR):
         os.makedirs(DATA_DIR)
-        
+
     filename = request.filename
     if not filename.endswith(".json"):
         filename += ".json"
-        
+
     file_path = os.path.join(DATA_DIR, filename)
-    
+
     try:
         with open(file_path, "w", encoding="utf-8") as f:
             json.dump(request.data, f, indent=2)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-        
+
     return {"message": "JSON file created successfully", "path": file_path}
+
 
 # To run: uvicorn api:app --reload

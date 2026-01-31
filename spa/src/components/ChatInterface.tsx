@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Send, Bot, User, StopCircle, RefreshCw } from 'lucide-react';
+import { Send, Bot, User, StopCircle, RefreshCw, Cpu, Globe } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 
 const API_URL = 'http://localhost:8000';
@@ -13,6 +13,7 @@ export default function ChatInterface() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
+  const [model, setModel] = useState<'local' | 'openai'>('local');
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -58,7 +59,7 @@ export default function ChatInterface() {
       const response = await fetch(`${API_URL}/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query: userMsg }),
+        body: JSON.stringify({ query: userMsg, model }),
       });
 
       if (!response.body) throw new Error("No response body");
@@ -96,6 +97,29 @@ export default function ChatInterface() {
 
   return (
     <div className="chat-container">
+      {/* Header with Model Selector */}
+      <div className="chat-header">
+        <h3>AI Assistant</h3>
+        <div className="model-selector">
+          <button 
+            className={`model-btn ${model === 'local' ? 'active' : ''}`}
+            onClick={() => setModel('local')}
+            title="Local LLM (Private & Free)"
+          >
+            <Cpu size={16} className="icon" />
+            <span>Local</span>
+          </button>
+          <button 
+            className={`model-btn ${model === 'openai' ? 'active' : ''}`}
+            onClick={() => setModel('openai')}
+            title="OpenAI GPT-3.5 (Requires Key, Smarter)"
+          >
+            <Globe size={16} className="icon" />
+            <span>OpenAI</span>
+          </button>
+        </div>
+      </div>
+
       <div className="messages-list">
         {messages.length === 0 && (
           <div className="empty-state">
