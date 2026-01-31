@@ -124,10 +124,10 @@ export default function ChatInterface() {
           <button 
             className={`model-btn ${model === 'openai' ? 'active' : ''}`}
             onClick={() => setModel('openai')}
-            title="OpenAI GPT-3.5 (Requires Key, Smarter)"
+            title="OpenAI GPT-4o (Requires Key, Smarter)"
           >
             <Globe size={16} className="icon" />
-            <span>OpenAI</span>
+            <span>OpenAI GPT-4o</span>
           </button>
         </div>
       </div>

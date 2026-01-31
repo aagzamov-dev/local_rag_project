@@ -179,7 +179,7 @@ def run_openai_agent(query, context_items, api_key):
     try:
         # First call
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model="gpt-4o",
             messages=messages,
             tools=tools,
             tool_choice="auto",
@@ -190,32 +190,34 @@ def run_openai_agent(query, context_items, api_key):
 
         # Check if tool call
         if response_msg.tool_calls:
-            # Append assistant's request to history
             messages.append(response_msg)
 
-            # Execute tools
             for tool_call in response_msg.tool_calls:
                 func_name = tool_call.function.name
+                # Only strictly allowed tools
+                if func_name not in AVAILABLE_TOOLS:
+                    continue
+
                 args = json.loads(tool_call.function.arguments)
+                tool_output = f"Error: Tool {func_name} failed"
 
-                if func_name in AVAILABLE_TOOLS:
+                try:
                     func_to_call = AVAILABLE_TOOLS[func_name]
-                    try:
-                        tool_output = func_to_call(**args)
-                    except Exception as e:
-                        tool_output = f"Error: {str(e)}"
+                    tool_output = func_to_call(**args)
+                except Exception as e:
+                    tool_output = f"Error: {str(e)}"
 
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": str(tool_output),
-                        }
-                    )
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": str(tool_output),
+                    }
+                )
 
             # Second call to get final answer
             final_res = client.chat.completions.create(
-                model="gpt-3.5-turbo", messages=messages, temperature=0.1
+                model="gpt-4o", messages=messages, temperature=0.1
             )
             return final_res.choices[0].message.content, True
 
