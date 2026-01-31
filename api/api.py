@@ -13,7 +13,6 @@ from rag_core import (
     query_documents,
     format_prompt,
     get_chroma_client,
-    run_openai_completion,
     finalize_answer,
 )
 
@@ -81,37 +80,31 @@ def startup_event():
 @app.post("/chat")
 async def chat_endpoint(request: ChatRequest):
     retrieved = query_documents(request.query, top_k=5)
-    prompt = format_prompt(request.query, retrieved)
+
+    # We NO LONGER pre-format prompt here for agents.
+    # Agents build their own prompts from query + retrieved context.
 
     response_text = ""
+    tool_used = False
 
     if request.model == "openai":
         api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key or "INSERT_YOUR_KEY" in api_key:
-            # Just a warning or strictly fail? User implies "take token", I'll assume they will update.
-            # But if I put placeholder, it will fail. I'll let it try.
-            if not api_key:
-                raise HTTPException(status_code=500, detail="OPENAI_API_KEY not set.")
+        if not api_key:
+            raise HTTPException(status_code=500, detail="OPENAI_API_KEY not set.")
 
-        response_text = run_openai_completion(prompt, api_key)
+        from rag_core import run_openai_agent
+
+        response_text, tool_used = run_openai_agent(request.query, retrieved, api_key)
 
     else:
         if not llm:
             raise HTTPException(status_code=500, detail="LLM not initialized.")
 
-        stream = llm.create_completion(
-            prompt,
-            max_tokens=512,
-            stop=["User:", "Question:", "Answer:", "<|im_end|>"],
-            stream=True,
-            temperature=0.1,
-            repeat_penalty=1.1,
-        )
+        from rag_core import run_local_agent
 
-        for output in stream:
-            response_text += output["choices"][0]["text"]
+        response_text, tool_used = run_local_agent(request.query, retrieved, llm)
 
-    final_response = finalize_answer(response_text, retrieved)
+    final_response = finalize_answer(response_text, retrieved, tool_used=tool_used)
 
     # Streaming the final string so frontend logic remains compatible
     def iter_final():

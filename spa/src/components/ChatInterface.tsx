@@ -7,6 +7,7 @@ const API_URL = 'http://localhost:8000';
 interface Message {
   role: 'user' | 'assistant';
   content: string;
+  model?: 'local' | 'openai';
 }
 
 export default function ChatInterface() {
@@ -45,6 +46,9 @@ export default function ChatInterface() {
     if (!input.trim() || loading) return;
 
     const userMsg = input.trim();
+    // Capture current model at start of request
+    const currentModel = model;
+    
     setInput('');
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
     
@@ -52,14 +56,13 @@ export default function ChatInterface() {
     setLoading(true);
 
     try {
-      // Add simplified logic for optimistic UI or wait for stream
-      // Create a placeholder for the assistant
-      setMessages(prev => [...prev, { role: 'assistant', content: '' }]);
+      // Create placeholder with correct model
+      setMessages(prev => [...prev, { role: 'assistant', content: '', model: currentModel }]);
       
       const response = await fetch(`${API_URL}/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query: userMsg, model }),
+        body: JSON.stringify({ query: userMsg, model: currentModel }),
       });
 
       if (!response.body) throw new Error("No response body");
@@ -78,7 +81,12 @@ export default function ChatInterface() {
           
           setMessages(prev => {
             const newArr = [...prev];
-            newArr[newArr.length - 1] = { role: 'assistant', content: currentResponse };
+            // Ensure we preserve the model field
+            newArr[newArr.length - 1] = { 
+                role: 'assistant', 
+                content: currentResponse,
+                model: currentModel
+            };
             return newArr;
           });
         }
@@ -87,7 +95,11 @@ export default function ChatInterface() {
       console.error(error);
       setMessages(prev => {
          const newArr = [...prev];
-         newArr[newArr.length - 1] = { role: 'assistant', content: '**Error**: Connection failed. Please check the backend.' };
+         newArr[newArr.length - 1] = { 
+             role: 'assistant', 
+             content: '**Error**: Connection failed. Please check the backend.',
+             model: currentModel
+         };
          return newArr;
       });
     } finally {
@@ -97,7 +109,7 @@ export default function ChatInterface() {
 
   return (
     <div className="chat-container">
-      {/* Header with Model Selector */}
+      {/* ... (Header unchanged) ... */}
       <div className="chat-header">
         <h3>AI Assistant</h3>
         <div className="model-selector">
@@ -143,16 +155,23 @@ export default function ChatInterface() {
                    <span></span><span></span><span></span>
                  </div>
                ) : (
-                 <ReactMarkdown>{msg.content}</ReactMarkdown>
+                 <>
+                   {msg.role === 'assistant' && (
+                       <div style={{fontSize: '0.7rem', opacity: 0.6, marginBottom: '4px', textTransform: 'uppercase', letterSpacing: '0.5px'}}>
+                         {msg.model || 'local'} used
+                       </div>
+                   )}
+                   <ReactMarkdown>{msg.content}</ReactMarkdown>
+                 </>
                )}
             </div>
           </div>
         ))}
-        {/* Helper to keep auto-scroll valid even if last message is incomplete */}
         <div ref={messagesEndRef} />
       </div>
 
       <div className="input-area glass-panel">
+         {/* ... (Input form unchanged) ... */}
         <form onSubmit={handleSubmit} className="input-form">
           <textarea
             ref={textareaRef}

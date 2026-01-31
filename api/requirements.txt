@@ -6,3 +6,5 @@ uvicorn
 pypdf
 python-multipart
 openai
+duckduckgo-search
+requests

@@ -1,7 +1,9 @@
 import os
 import re
 import logging
+import json
 from openai import OpenAI
+from tools import get_openai_tools, get_local_tools_prompt, AVAILABLE_TOOLS
 
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN_WARNING"] = "1"
@@ -139,59 +141,192 @@ Answer:"""
     return prompt
 
 
-def run_openai_completion(prompt, api_key):
+def run_openai_agent(query, context_items, api_key):
+    """
+    OpenAI Agent with Tool Calling support.
+    Constructs a prompt that integrates RAG context but allows tools if needed.
+    """
     client = OpenAI(api_key=api_key)
+    tools = get_openai_tools()
+
+    # Build context string
+    context_blocks = []
+    for item in context_items:
+        cite = _citation_for_item(item)
+        context_blocks.append(f"{cite}\n{item['content']}")
+    context_str = "\n\n".join(context_blocks)
+
+    system_prompt = """You are a helpful and intelligent assistant.
+    
+    You have access to a knowledge base (CONTEXT) and external tools.
+    
+    STRATEGY:
+    1. First, check if the user's question can be answered using the provided CONTEXT. 
+       - If YES, verify the facts, use them to answer, and cite the source filename in your answer if relevant.
+    2. If the CONTEXT is missing, irrelevant, or does not contain the answer, you SHOULD use the available tools (e.g. web_search, get_weather) to find the answer.
+    3. If the question is about current events, weather, or specific real-time data, IGNORE the context and immediate use the tools.
+    
+    Do not mention "I don't have enough information" unless you have tried both the context AND the tools and failed.
+    """
+
+    user_msg = f"Context:\n{context_str}\n\nQuestion: {query}"
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_msg},
+    ]
+
     try:
+        # First call
         response = client.chat.completions.create(
             model="gpt-3.5-turbo",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a helpful assistant. Keep your answers concise and strictly based on the context provided entirely in the user prompt.",
-                },
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=200,
+            messages=messages,
+            tools=tools,
+            tool_choice="auto",
             temperature=0.1,
         )
-        return response.choices[0].message.content
+
+        response_msg = response.choices[0].message
+
+        # Check if tool call
+        if response_msg.tool_calls:
+            # Append assistant's request to history
+            messages.append(response_msg)
+
+            # Execute tools
+            for tool_call in response_msg.tool_calls:
+                func_name = tool_call.function.name
+                args = json.loads(tool_call.function.arguments)
+
+                if func_name in AVAILABLE_TOOLS:
+                    func_to_call = AVAILABLE_TOOLS[func_name]
+                    try:
+                        tool_output = func_to_call(**args)
+                    except Exception as e:
+                        tool_output = f"Error: {str(e)}"
+
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": str(tool_output),
+                        }
+                    )
+
+            # Second call to get final answer
+            final_res = client.chat.completions.create(
+                model="gpt-3.5-turbo", messages=messages, temperature=0.1
+            )
+            return final_res.choices[0].message.content, True
+
+        else:
+            return response_msg.content, False
+
     except Exception as e:
-        return f"OpenAI Error: {str(e)}"
+        return f"OpenAI Agent Error: {str(e)}", False
 
 
-def finalize_answer(model_text, retrieved_items):
+def run_local_agent(query, context_items, llm):
+    """
+    Local Agent using ReAct (Thought-Action-Observation) styling.
+    """
+    tool_instructions = get_local_tools_prompt()
+
+    # Build text context
+    context_blocks = []
+    for item in context_items:
+        cite = _citation_for_item(item)
+        context_blocks.append(f"{cite}\n{item['content']}")
+    context_str = "\n\n".join(context_blocks)
+
+    # Prompt engineering for local model (Llama-3 style or Alpaca style)
+    # We need a prompt that encourages checking context first, then tools.
+
+    full_prompt = f"""You are a helpful assistant.
+
+TOOLS:
+{tool_instructions}
+
+CONTEXT:
+{context_str}
+
+INSTRUCTIONS:
+1. Try to answer the User's Question using the CONTEXT above.
+2. If the CONTEXT is not relevant or missing the answer, use a tool (like web_search or get_weather).
+3. To use a tool, output: req_tool: tool_name("arg")
+4. Do NOT say "I don't have enough information" without trying a tool first.
+
+User: {query}
+Assistant:"""
+
+    # 1. Generate (Stop at req_tool: or normal stops)
+    output = llm.create_completion(
+        full_prompt,
+        max_tokens=256,
+        stop=["Observation:", "User:", "<|im_end|>"],
+        temperature=0.1,
+    )
+    text = output["choices"][0]["text"]
+
+    if "req_tool:" in text:
+        try:
+            tool_request = text.split("req_tool:")[-1].strip()
+            if "(" in tool_request and ")" in tool_request:
+                func_name = tool_request.split("(")[0].strip()
+                arg_raw = tool_request.split("(")[1].split(")")[0]
+                arg_val = arg_raw.strip('"').strip("'")
+
+                if func_name in AVAILABLE_TOOLS:
+                    print(f"Local Agent Calling: {func_name} with {arg_val}")
+                    result = AVAILABLE_TOOLS[func_name](arg_val)
+
+                    # Feed back observation
+                    new_prompt = (
+                        f"{full_prompt}{text}\nObservation: {result}\nAssistant:"
+                    )
+
+                    final_out = llm.create_completion(
+                        new_prompt,
+                        max_tokens=256,
+                        stop=["User:", "<|im_end|>"],
+                        temperature=0.1,
+                    )
+                    return final_out["choices"][0]["text"], True
+
+            return text + "\n[System: Could not parse tool request properly]", False
+
+        except Exception as e:
+            return f"{text} [Error processing tool request: {e}]", False
+
+    return text, False
+
+
+def finalize_answer(model_text, retrieved_items, tool_used=False):
     text = model_text.strip()
-
-    # Strip brackets first
     text = re.sub(r"\[[^\]]+\]", "", text).strip()
     text = re.sub(r"\s+", " ", text).strip()
-
-    # Fix spacing before punctuation
     text = re.sub(r"\s+([,.!?])", r"\1", text)
 
-    # Deterministic fallback check
-    if FALLBACK.lower() in text.lower():
+    if FALLBACK.lower() in text.lower() and len(text) < 100:
         return FALLBACK
 
-    # Calculate percentages based on similarity
-    # similarity = 1 - cosine_distance
-    # Clip to [0, 1] just in case
+    # HIDE SOURCES IF TOOL USED
+    if tool_used:
+        return text
+
     scores = []
     total_score = 0.0
-
     for item in retrieved_items:
         dist = item.get("distance", 1.0)
-        # Handle cases where dist might be > 1 or < 0
         sim = max(0.0, 1.0 - dist)
         scores.append(sim)
         total_score += sim
 
     if total_score <= 0:
-        total_score = 1.0  # Avoid division by zero
+        total_score = 1.0
 
     sources_list = []
     seen = set()
-
     for item, score in zip(retrieved_items, scores):
         c = _citation_for_item(item)
         if c not in seen:
